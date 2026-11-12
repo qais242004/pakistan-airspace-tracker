@@ -1,11 +1,14 @@
+import os
 import json
-import time
-import sqlite3
 import requests
 import pandas as pd
 import shapely
 from shapely.geometry import shape
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+load_dotenv()
 
 URL = "https://opensky-network.org/api/states/all"
 
@@ -23,38 +26,29 @@ COLUMNS = [
     "spi", "position_source",
 ]
 
-INTERVAL_SECONDS = 900
-
 with open("pakistan.geo.json", encoding="utf-8") as file:
     PAKISTAN = shape(json.load(file)["geometry"])
 
 
-def fetch_and_save():
+def fetch_planes():
     response = requests.get(URL, params=PARAMS, timeout=30)
     response.raise_for_status()
     data = response.json()
 
     planes = data["states"] or []
     df = pd.DataFrame(planes, columns=COLUMNS)
+    for col in ["time_position", "last_contact"]:
+        df[col] = df[col].astype("float64")
     df["fetched_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-    conn = sqlite3.connect("flights.db")
-    df.to_sql("raw_flights", conn, if_exists="append", index=False)
-    conn.close()
-    return len(df)
+    return df
 
 
-def build_clean_table():
-    conn = sqlite3.connect("flights.db")
-    raw = pd.read_sql(
-        "SELECT * FROM raw_flights WHERE latitude IS NOT NULL AND longitude IS NOT NULL",
-        conn,
-    )
-
+def clean_planes(raw):
+    raw = raw[raw["latitude"].notna() & raw["longitude"].notna()]
     inside = shapely.contains_xy(PAKISTAN, raw["longitude"], raw["latitude"])
     raw = raw[inside]
 
-    clean = pd.DataFrame({
+    return pd.DataFrame({
         "icao24": raw["icao24"],
         "callsign": raw["callsign"].str.strip(),
         "origin_country": raw["origin_country"],
@@ -66,17 +60,26 @@ def build_clean_table():
         "fetched_at": raw["fetched_at"],
     })
 
-    clean.to_sql("clean_flights", conn, if_exists="replace", index=False)
-    conn.close()
-    return len(clean)
+
+def main():
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise SystemExit("DATABASE_URL nahi mila, .env file check karo")
+
+    engine = create_engine(database_url, pool_pre_ping=True)
+
+    raw = fetch_planes()
+    clean = clean_planes(raw)
+
+    raw.to_sql("raw_flights", engine, if_exists="append", index=False)
+    clean.to_sql("clean_flights", engine, if_exists="append", index=False)
+
+    with engine.connect() as conn:
+        raw_total = conn.execute(text("SELECT COUNT(*) FROM raw_flights")).scalar()
+        clean_total = conn.execute(text("SELECT COUNT(*) FROM clean_flights")).scalar()
+
+    print(f"Is run mein: raw {len(raw)} | clean (Pakistan) {len(clean)}")
+    print(f"Neon mein total: raw {raw_total} | clean {clean_total}")
 
 
-while True:
-    now = datetime.now().strftime("%H:%M:%S")
-    try:
-        new_rows = fetch_and_save()
-        clean_total = build_clean_table()
-        print(f"[{now}] new rows: {new_rows} | clean rows inside Pakistan: {clean_total}")
-    except Exception as error:
-        print(f"[{now}] error: {error}")
-    time.sleep(INTERVAL_SECONDS)
+main()

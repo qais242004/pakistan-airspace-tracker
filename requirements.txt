@@ -2,3 +2,6 @@ requests
 pandas
 streamlit
 shapely
+sqlalchemy
+psycopg[binary]
+python-dotenv
