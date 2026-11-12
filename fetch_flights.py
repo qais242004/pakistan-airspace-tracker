@@ -1,7 +1,10 @@
+import json
 import time
 import sqlite3
 import requests
 import pandas as pd
+import shapely
+from shapely.geometry import shape
 from datetime import datetime, timezone
 
 URL = "https://opensky-network.org/api/states/all"
@@ -22,6 +25,9 @@ COLUMNS = [
 
 INTERVAL_SECONDS = 900
 
+with open("pakistan.geo.json", encoding="utf-8") as file:
+    PAKISTAN = shape(json.load(file)["geometry"])
+
 
 def fetch_and_save():
     response = requests.get(URL, params=PARAMS, timeout=30)
@@ -40,27 +46,29 @@ def fetch_and_save():
 
 def build_clean_table():
     conn = sqlite3.connect("flights.db")
-    conn.execute("DROP TABLE IF EXISTS clean_flights")
-    conn.execute("""
-    CREATE TABLE clean_flights AS
-    SELECT
-        icao24,
-        TRIM(callsign) AS callsign,
-        origin_country,
-        latitude,
-        longitude,
-        ROUND(baro_altitude * 3.28084) AS altitude_ft,
-        ROUND(velocity * 3.6, 1) AS speed_kmh,
-        CASE WHEN on_ground = 1 THEN 'ground' ELSE 'air' END AS status,
-        fetched_at
-    FROM raw_flights
-    WHERE latitude IS NOT NULL
-      AND longitude IS NOT NULL
-    """)
-    conn.commit()
-    total = conn.execute("SELECT COUNT(*) FROM clean_flights").fetchone()[0]
+    raw = pd.read_sql(
+        "SELECT * FROM raw_flights WHERE latitude IS NOT NULL AND longitude IS NOT NULL",
+        conn,
+    )
+
+    inside = shapely.contains_xy(PAKISTAN, raw["longitude"], raw["latitude"])
+    raw = raw[inside]
+
+    clean = pd.DataFrame({
+        "icao24": raw["icao24"],
+        "callsign": raw["callsign"].str.strip(),
+        "origin_country": raw["origin_country"],
+        "latitude": raw["latitude"],
+        "longitude": raw["longitude"],
+        "altitude_ft": (raw["baro_altitude"] * 3.28084).round(),
+        "speed_kmh": (raw["velocity"] * 3.6).round(1),
+        "status": raw["on_ground"].apply(lambda v: "ground" if v == 1 else "air"),
+        "fetched_at": raw["fetched_at"],
+    })
+
+    clean.to_sql("clean_flights", conn, if_exists="replace", index=False)
     conn.close()
-    return total
+    return len(clean)
 
 
 while True:
@@ -68,7 +76,7 @@ while True:
     try:
         new_rows = fetch_and_save()
         clean_total = build_clean_table()
-        print(f"[{now}] new rows: {new_rows} | clean table total: {clean_total}")
+        print(f"[{now}] new rows: {new_rows} | clean rows inside Pakistan: {clean_total}")
     except Exception as error:
         print(f"[{now}] error: {error}")
     time.sleep(INTERVAL_SECONDS)
