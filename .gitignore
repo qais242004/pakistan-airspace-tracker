@@ -1,0 +1,3 @@
+venv/
+flights.db
+__pycache__/
